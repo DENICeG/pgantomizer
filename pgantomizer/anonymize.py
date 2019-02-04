@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import sys
+from random import randint
 
 import psycopg2
 
@@ -16,14 +17,16 @@ DEFAULT_PK_COLUMN_NAME = 'id'
 NULL_ANONYMIZE = lambda column, pk_name: 'NULL'
 
 ANONYMIZE_DATA_TYPE = {
-    'timestamp with time zone': "'1111-11-11 11:11:11.111111+00'",
+    'timestamp with time zone': "timestamp '2014-01-10 20:00:00' + random() * (timestamp '2019-01-20 20:00:00' - timestamp '2014-01-10 10:00:00')",
     'date': "'1111-11-11'",
     'boolean': 'random() > 0.5',
-    'integer': 'ceil(random() * 100)',
-    'smallint': 'ceil(random() * 100)',
-    'numeric': 'floor(random() * 10)',
-    'character varying': lambda column, pk_name: "'{}_' || {}".format(column, pk_name),
-    'text': lambda column, pk_name: "'{}_' || {}".format(column, pk_name),
+    'integer': 'ceil(random() * 2147483647)',
+    'smallint': 'ceil(random() * 1000)',
+    'numeric': 'floor(random() * 100)',
+    #'character varying': lambda column, pk_name: "'{}_' || {}".format(column, pk_name),
+    'character varying': lambda column, pk_name: "'{}_' || {}".format(column, "ceil(random() * 100000) || '.' || ceil(random() * 100000) || '.' || ceil(random() * 100000)"),
+    #'text': lambda column, pk_name: "'{}_' || {}".format(column, pk_name),
+    'text': lambda column, pk_name: "'{}_' || {}".format(column, "ceil(random() * 100000) || '.' || ceil(random() * 100000) || '.' || ceil(random() * 100000)"),
     'inet': "'111.111.111.111'",
     'json': "'{}'",
     'tsvector': NULL_ANONYMIZE
@@ -121,6 +124,8 @@ def check_schema(cursor, schema, db_args):
         if pk_column is not None and pk_column != "~":
             columns_to_validate.append(pk_column)
         try:
+            print("table: ",table)
+            print("columns_to_validate:" , columns_to_validate)
             if columns_to_validate:
                cursor.execute("SELECT {columns} FROM {table} LIMIT 1;".format(
                    columns='"{}"'.format('", "'.join(columns_to_validate)),
@@ -180,17 +185,20 @@ def anonymize_table(conn, cursor, schema, table, disable_schema_changes, tablesc
         if not disable_schema_changes: # Bypass schema changes if explicitly requested
             prepare_column_for_anonymization(conn, cursor, tablewithschema, column_name, data_type, character_maximum_length)
         column_update = get_column_update(schema, tablewithschema, column_name, data_type)
+        
         if column_update is not None:
             column_updates.append(column_update)
             updated_column_names.append(column_name)
 
     # Process UPDATE if any column_updates requested
+    print("column_updates: ",column_updates)
     if len(column_updates) > 0:
         update_statement = "UPDATE {table} SET {column_updates_sql} {where_clause}".format(
             table=tablewithschema,
             column_updates_sql=", ".join(column_updates),
             where_clause="WHERE {}".format(schema[tablewithschema].get('where', 'TRUE') if schema[tablewithschema] else 'TRUE')
         )
+        print("SQL CMD: ", update_statement);
         logging.debug('Running UPDATE on {} for columns {} ...'.format(tablewithschema, ", ".join(updated_column_names)))
         cursor.execute(update_statement)
     else:
@@ -204,7 +212,20 @@ def anonymize_db(schema, db_args, disable_schema_changes,tableschema):
             cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = '{tableschema}' AND table_type <> 'VIEW' ORDER BY table_name;".format(
                 tableschema=tableschema
             ))
-            for table_name in cursor.fetchall():
+            tablenames = cursor.fetchall()
+            for table_name in tablenames:
+                if tableschema == 'public':
+                   tablewithschema = table_name[0]
+                else:
+                   tablewithschema = tableschema+"."+table_name[0]
+
+                cursor.execute("SELECT column_name, data_type, character_maximum_length FROM information_schema.columns "
+                   "WHERE table_schema = '{}' AND table_name = '{}'".format(tableschema,table_name[0]))
+                for column_name, data_type, character_maximum_length in cursor.fetchall():
+                   if not disable_schema_changes: # Bypass schema changes if explicitly requested
+                      prepare_column_for_anonymization(conn, cursor, tablewithschema, column_name, data_type, character_maximum_length)
+
+            for table_name in tablenames:
                 anonymize_table(conn, cursor, schema, table_name[0], disable_schema_changes,tableschema)
             logging.debug('Anonymization complete!')
 
@@ -221,7 +242,7 @@ def load_anonymize_remove(dump_file, schema, tableschema, skip_restore=False, di
             load_db_to_new_instance(dump_file, db_args,tableschema)
             anonymize_db(schema, db_args, disable_schema_changes, tableschema)
         except Exception: # Any exception must result into droping the schema to prevent sensitive data leakage
-            drop_schema(db_args,tableschema)
+            #drop_schema(db_args,tableschema)
             raise
         finally:
             if not leave_dump:
